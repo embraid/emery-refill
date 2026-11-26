@@ -1,0 +1,15 @@
+{
+  "name": "refill-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Synthetic, loopback-only prescription renewal rehearsal using Node.js and SQLite.",
+  "scripts": {
+    "start": "node index.mjs server",
+    "serve": "node index.mjs server",
+    "test": "node --test test/store.test.mjs test/authorization.test.mjs test/authorization.http.test.mjs test/loopback-binding.test.mjs test/role-views.http.test.mjs test/patient-request.store.test.mjs test/patient-prescriptions.store.test.mjs test/ask.http.test.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
