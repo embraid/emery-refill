@@ -10,6 +10,7 @@ import {
   caseRefFor,
   listPatientPrescriptions,
   askPatientForRenewal,
+  handoffRenewalToPrescriber,
 } from './store.mjs';
 import {
   renderSignInPage,
@@ -99,6 +100,41 @@ const ASK_SAVE_FAILED_HTML = `<!DOCTYPE html>
 </html>
 `;
 
+// Same fixed recoverable wording as the ask save failure (the accepted
+// plan reuses the existing wording verbatim), with its own stable error id.
+const HANDOFF_SAVE_FAILED_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Save failed — Refill Relay</title>
+</head>
+<body>
+<h1>Your request could not be saved</h1>
+<p id="handoff-save-error" class="error" role="alert" tabindex="-1">Your request could not be saved. Nothing was changed; please try again.</p>
+</body>
+</html>
+`;
+
+const HANDOFF_INVALID_STATE_BODY = Object.freeze({
+  ok: false,
+  error: 'invalid-case-state',
+  message: 'This case can no longer be handed off.',
+});
+
+// Fixed 500 for a malformed test-only overlap observer: the observer is
+// accepted by the server so it can reach a live handler, but the store
+// rejects it BEFORE any database write and before any barrier effect (a
+// 3-cell buffer could reach the server yet would raise RangeError on the
+// store's post-commit proof write, so it is refused there up front). The
+// product never passes the option (seams off by default at startup), so
+// this branch is test-only.
+const HANDOFF_OBSERVER_MALFORMED_BODY = Object.freeze({
+  ok: false,
+  error: 'handoff-observer-malformed',
+  message: 'The request could not be processed; no state was changed.',
+});
+
 export function readSessionToken(cookieHeader) {
   if (typeof cookieHeader !== 'string' || cookieHeader === '') return undefined;
   for (const part of cookieHeader.split(';')) {
@@ -112,6 +148,30 @@ export function readSessionToken(cookieHeader) {
 
 export function createAppHandler(dbPath, options = {}) {
   let askCommitFailureArmed = Boolean(options.askCommitFailure);
+  let handoffCommitFailureArmed = Boolean(options.handoffCommitFailure);
+  // Test-only overlap-observation cells (SAB-backed Int32Array shared with
+  // the store's handoffBarrier): cell 0 = handler entry count, cell 1 = a
+  // first writer is holding uncommitted writes, cell 2 = release, cell 3 =
+  // the entry count captured BEFORE the first successful commit — the
+  // precommit proof, written ONLY by the store (it captures the count
+  // before the COMMIT and publishes it only after the COMMIT succeeds).
+  // The HTTP layer never writes cell 3. The SAB is accepted here when
+  // present so an explicitly malformed observer (e.g. a 3-cell buffer)
+  // can reach the server and be rejected per request; the store re-
+  // validates the FOUR usable shared cells BEFORE any database write and
+  // before any barrier effect (a 3-cell buffer would otherwise raise
+  // RangeError on the post-commit proof write). Off by default; product
+  // startup (index.mjs) passes no options.
+  const handoffObserve =
+    options && options.handoffObserve instanceof SharedArrayBuffer
+      ? new Int32Array(options.handoffObserve)
+      : null;
+  // Usability check (no effect, no throw): the four protocol cells (16
+  // bytes). A shorter observer is still handed to the store — which
+  // rejects it BEFORE any database write and before any barrier effect —
+  // but the HTTP layer performs no barrier bookkeeping of its own for it,
+  // so the malformed-observer rejection leaves zero cell effects.
+  const handoffObserveUsable = handoffObserve !== null && handoffObserve.byteLength >= 16;
 
   const readJsonBody = (req) =>
     new Promise((resolve, reject) => {
@@ -583,6 +643,144 @@ export function createAppHandler(dbPath, options = {}) {
           created: result.created,
           code: result.code,
           renewal,
+        });
+      }
+
+      if (method === 'POST' && route === '/handoff') {
+        const html = wantsHtml(req.headers.accept);
+        const identity = resolveSession(readSessionToken(req.headers.cookie));
+        if (!identity) {
+          if (html) {
+            return sendHtml(res, 401, renderSignInPage({
+              error: DENIAL_BODIES['no-session'].message,
+              returnTo: '/cases',
+            }));
+          }
+          return sendJson(res, 401, { ...DENIAL_BODIES['no-session'] });
+        }
+        if (identity.role !== 'pharmacy') {
+          // Fixed denial (no case data): only the responsible pharmacy can
+          // hand the case off; the store would deny 'not-authorized' for
+          // the same reason.
+          if (html) {
+            return sendHtml(res, 403, renderAccessDeniedPage({
+              reason: 'not-authorized',
+              message: DENIAL_BODIES['not-authorized'].message,
+            }));
+          }
+          return sendJson(res, 403, { ...DENIAL_BODIES['not-authorized'] });
+        }
+        // Test-only overlap observation (only when the option is present):
+        // this request has entered the handoff handler. Record the entry,
+        // and — if a first writer is already holding uncommitted writes
+        // (cell 1) — release its hold (cell 2) from this second entry.
+        // A malformed (short) observer gets no handler-side barrier effect
+        // at all: it is passed through so the store can reject it before
+        // any database write and before any barrier effect.
+        const storeOptions = {};
+        if (handoffObserve && handoffObserveUsable) {
+          Atomics.add(handoffObserve, 0, 1);
+          Atomics.notify(handoffObserve, 0);
+          if (Atomics.load(handoffObserve, 1) === 1) {
+            Atomics.store(handoffObserve, 2, 1);
+            Atomics.notify(handoffObserve, 2);
+          }
+          storeOptions.handoffBarrier = handoffObserve;
+        } else if (handoffObserve) {
+          storeOptions.handoffBarrier = handoffObserve;
+        }
+        // Consume the one-shot save-failure seam (test-only) BEFORE the
+        // store call so the outcome maps to the request that tripped it.
+        if (handoffCommitFailureArmed) {
+          storeOptions.failHandoffCommit = true;
+          handoffCommitFailureArmed = false;
+        }
+
+        const contentType = String(req.headers['content-type'] ?? '');
+        const isForm = contentType.includes('application/x-www-form-urlencoded');
+        const fields = isForm ? await readFormBody(req) : await readJsonBody(req);
+        const caseRefField = fields.case_ref;
+        // Same tolerant resolution as the case routes: a stable opaque ref
+        // that resolves maps to the record id; anything else is treated as
+        // a literal id (unknown values deny with the same opaque reason).
+        const targetId =
+          caseRefField === undefined || caseRefField === null || caseRefField === ''
+            ? ''
+            : (resolveCaseRef(dbPath, String(caseRefField)) ?? String(caseRefField));
+        const result = handoffRenewalToPrescriber(
+          dbPath,
+          identity,
+          targetId,
+          storeOptions
+        );
+
+        // NOTE: there is deliberately NO post-commit observation here. The
+        // store is the ONLY writer of cell 3 (the precommit proof): it
+        // captures the observed entry count before the COMMIT and
+        // publishes it only after the COMMIT succeeds. Any handler-side
+        // overwrite after the store returns could replace the proof value
+        // with a later (larger) count, so it must not exist.
+
+        if (!result.ok) {
+          switch (result.code) {
+            case 'invalid-case-state':
+              // Fixed 422: the case is saved in a state that can no longer
+              // be handed off (a final outcome). No event, no change.
+              return html
+                ? sendHtml(res, 422, renderAccessDeniedPage({
+                  reason: 'invalid-case-state',
+                  message: HANDOFF_INVALID_STATE_BODY.message,
+                }))
+                : sendJson(res, 422, { ...HANDOFF_INVALID_STATE_BODY });
+            case 'handoff-save-failed':
+              return html
+                ? sendHtml(res, 503, HANDOFF_SAVE_FAILED_HTML)
+                : sendJson(res, 503, {
+                  ok: false,
+                  error: 'handoff-save-failed',
+                  recoverable: true,
+                  message: 'Your request could not be saved. Nothing was changed; please try again.',
+                });
+            case 'handoff-observer-malformed':
+              // The store rejected the malformed test-only observer BEFORE
+              // any durable write and before any barrier effect: fixed
+              // 500, no case data, no state change (test-only path — the
+              // product never passes the option).
+              return html
+                ? sendHtml(res, 500, renderNotFoundPage({ message: HANDOFF_OBSERVER_MALFORMED_BODY.message }))
+                : sendJson(res, 500, { ...HANDOFF_OBSERVER_MALFORMED_BODY });
+            case 'not-authorized':
+            default:
+              return html
+                ? sendHtml(res, 403, renderAccessDeniedPage({
+                  reason: 'not-authorized',
+                  message: DENIAL_BODIES['not-authorized'].message,
+                }))
+                : sendJson(res, 403, { ...DENIAL_BODIES['not-authorized'] });
+          }
+        }
+
+        // ok outcomes: handed-off (200) / already-handed-off (200).
+        // 200 — not 201: the operation changes the state of the SAME
+        // renewal; it creates no new case resource (the deliberate /ask
+        // 201 contrast).
+        if (html) {
+          // 303 to the stable case detail: the detail view renders the
+          // durable status, the next actor, and the handoff time — no
+          // record data in the redirect.
+          return sendHtml(res, 303, '', { Location: `/cases?case=${caseRefFor(result.renewal.id)}` });
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          created: result.created,
+          code: result.code,
+          renewal: {
+            id: result.renewal.id,
+            status: result.renewal.status,
+            next_actor: result.renewal.next_actor,
+            handoff_at: result.renewal.handoff_at,
+            submitted_at: result.renewal.submitted_at,
+          },
         });
       }
 

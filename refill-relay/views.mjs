@@ -232,6 +232,19 @@ export function renderRoleCasePage({ role, identity, case: caseView, refillsRema
   const c = caseView;
   const status = statusText(c.status);
   const nextActor = nextActorText(c.next_actor);
+  // The native, no-JS "Request renewal" handoff affordance: it exists ONLY
+  // for the responsible pharmacy on a case saved in 'Sent to pharmacy'.
+  // It is a labeled native POST form (the estate's form convention) that
+  // carries the stable opaque case reference; the server reauthorizes the
+  // action on every submission. After a successful handoff the status is
+  // 'Awaiting prescriber', so the form disappears on refresh — the durable
+  // state is authoritative and no second control can be presented.
+  const handoffForm = role === 'pharmacy' && c.status === STATUS_LABELS.SENT_TO_PHARMACY
+    ? `<form method="post" action="/handoff" aria-label="Request renewal">
+  <input type="hidden" name="case_ref" value="${esc(stableCaseRef(c.id))}">
+  <button type="submit">Request renewal</button>
+</form>`
+    : '';
   const main = `
 <nav aria-label="Back to queue"><a href="/cases">Back to my queue</a></nav>
 <h2>Saved renewal case</h2>
@@ -246,7 +259,8 @@ ${detailField('Submitted at', esc(timestampText(c.submitted_at)))}
 ${detailField('Handoff at', esc(timestampText(c.handoff_at)))}
 ${detailField('Decided at', esc(timestampText(c.decided_at)))}
 ${detailField('Granted refills', c.granted_refills === null || c.granted_refills === undefined ? 'Not decided' : String(c.granted_refills))}
-</dl>`;
+</dl>
+${handoffForm}`;
   return page({
     title: `Case for ${c.patient_name} — ${ROLE_PORTAL_LABEL[role] ?? role} — Refill Relay`,
     heading: `${ROLE_PORTAL_LABEL[role] ?? role} case: ${c.patient_name}`,

@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node index.mjs server",
     "serve": "node index.mjs server",
-    "test": "node --test test/store.test.mjs test/authorization.test.mjs test/authorization.http.test.mjs test/loopback-binding.test.mjs test/role-views.http.test.mjs test/patient-request.store.test.mjs test/patient-prescriptions.store.test.mjs test/ask.http.test.mjs"
+    "test": "node --test test/store.test.mjs test/authorization.test.mjs test/authorization.http.test.mjs test/loopback-binding.test.mjs test/role-views.http.test.mjs test/patient-request.store.test.mjs test/patient-prescriptions.store.test.mjs test/ask.http.test.mjs test/handoff.store.test.mjs test/handoff.http.test.mjs",
+    "test:handoff": "node --test test/handoff.store.test.mjs test/handoff.http.test.mjs"
   },
   "engines": {
     "node": ">=24"
