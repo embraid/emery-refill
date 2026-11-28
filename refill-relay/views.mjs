@@ -232,6 +232,26 @@ export function renderRoleCasePage({ role, identity, case: caseView, refillsRema
   const c = caseView;
   const status = statusText(c.status);
   const nextActor = nextActorText(c.next_actor);
+  // Pharmacy handoff affordance: exactly ONE native form, rendered only for
+  // the pharmacy role while the saved status is 'Sent to pharmacy'. The
+  // detail page is already object-level authorized, so a pharmacy role here
+  // is always the case's assigned pharmacy — a prescriber, a patient, an
+  // unrelated pharmacy (which is denied before render), or any other saved
+  // status never sees a handoff control. The hidden field carries the
+  // STABLE case reference (same derivation as the queue and copied links);
+  // the form POSTs it to the /handoff route, where the server reauthorizes
+  // the session, role, and assignment before any write. No inline scripts
+  // or event handlers (estate rule, asserted by the role-view tests);
+  // outside this window the page shows the saved status, next actor, and
+  // handoff time only.
+  const handoffForm =
+    role === 'pharmacy' && c.status === STATUS_LABELS.SENT_TO_PHARMACY
+      ? `
+<form method="post" action="/handoff" aria-label="Request renewal">
+  <input type="hidden" name="case_ref" value="${esc(stableCaseRef(c.id))}">
+  <button type="submit">Request renewal</button>
+</form>`
+      : '';
   const main = `
 <nav aria-label="Back to queue"><a href="/cases">Back to my queue</a></nav>
 <h2>Saved renewal case</h2>
@@ -246,7 +266,7 @@ ${detailField('Submitted at', esc(timestampText(c.submitted_at)))}
 ${detailField('Handoff at', esc(timestampText(c.handoff_at)))}
 ${detailField('Decided at', esc(timestampText(c.decided_at)))}
 ${detailField('Granted refills', c.granted_refills === null || c.granted_refills === undefined ? 'Not decided' : String(c.granted_refills))}
-</dl>`;
+</dl>${handoffForm}`;
   return page({
     title: `Case for ${c.patient_name} — ${ROLE_PORTAL_LABEL[role] ?? role} — Refill Relay`,
     heading: `${ROLE_PORTAL_LABEL[role] ?? role} case: ${c.patient_name}`,
