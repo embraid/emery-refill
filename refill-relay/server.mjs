@@ -10,6 +10,7 @@ import {
   caseRefFor,
   listPatientPrescriptions,
   askPatientForRenewal,
+  handoffRenewalToPrescriber,
 } from './store.mjs';
 import {
   renderSignInPage,
@@ -99,6 +100,20 @@ const ASK_SAVE_FAILED_HTML = `<!DOCTYPE html>
 </html>
 `;
 
+const HANDOFF_SAVE_FAILED_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Save failed — Refill Relay</title>
+</head>
+<body>
+<h1>Your handoff could not be saved</h1>
+<p id="handoff-save-error" class="error" role="alert" tabindex="-1">Your handoff could not be saved. Nothing was changed; please try again.</p>
+</body>
+</html>
+`;
+
 export function readSessionToken(cookieHeader) {
   if (typeof cookieHeader !== 'string' || cookieHeader === '') return undefined;
   for (const part of cookieHeader.split(';')) {
@@ -112,6 +127,24 @@ export function readSessionToken(cookieHeader) {
 
 export function createAppHandler(dbPath, options = {}) {
   let askCommitFailureArmed = Boolean(options.askCommitFailure);
+  let handoffCommitFailureArmed = Boolean(options.handoffCommitFailure);
+  // Test-only, off by default: the fresh-case overlap test arms this on a
+  // dedicated handler instance. It fires once per POST /handoff request,
+  // AFTER session/role/body parsing has passed and immediately BEFORE the
+  // synchronous store call, and the handler awaits the promise it returns.
+  // The event loop stays free while awaiting (no DB call and no write
+  // transaction is open), so a second overlapping request can also reach
+  // the rendezvous; the test bounds the wait with its own deadline and
+  // releases both requests in a finally. Every other startup leaves it
+  // undefined, in which case the handler proceeds straight to the store
+  // call. Not exposed through any route; production behavior is unchanged.
+  const handoffArrivalRendezvous =
+    typeof options.handoffArrivalRendezvous === 'function'
+      ? options.handoffArrivalRendezvous
+      : undefined;
+  // Per-handler-instance arrival counter for the rendezvous record
+  // descriptor (1-based request ordering within this handler instance).
+  let handoffArrivalSeq = 0;
 
   const readJsonBody = (req) =>
     new Promise((resolve, reject) => {
@@ -583,6 +616,118 @@ export function createAppHandler(dbPath, options = {}) {
           created: result.created,
           code: result.code,
           renewal,
+        });
+      }
+
+      if (method === 'POST' && route === '/handoff') {
+        const html = wantsHtml(req.headers.accept);
+        const identity = resolveSession(readSessionToken(req.headers.cookie));
+        if (!identity) {
+          if (html) {
+            return sendHtml(res, 401, renderSignInPage({
+              error: DENIAL_BODIES['no-session'].message,
+              returnTo: '/cases',
+            }));
+          }
+          return sendJson(res, 401, { ...DENIAL_BODIES['no-session'] });
+        }
+        if (identity.role !== 'pharmacy') {
+          // Fixed denial (no case data, no returnTo): non-pharmacies cannot
+          // hand off; the store would deny 'not-authorized' for the same
+          // reason (and re-checks assignment before any write).
+          if (html) {
+            return sendHtml(res, 403, renderAccessDeniedPage({
+              reason: 'not-authorized',
+              message: DENIAL_BODIES['not-authorized'].message,
+            }));
+          }
+          return sendJson(res, 403, { ...DENIAL_BODIES['not-authorized'] });
+        }
+        // Consume the one-shot save-failure seam (test-only) BEFORE the
+        // store call so the outcome maps to the request that tripped it
+        // (identical to the ask seam).
+        const optionsForHandoff = handoffCommitFailureArmed
+          ? { failHandoffCommit: true }
+          : {};
+        handoffCommitFailureArmed = false;
+
+        const contentType = String(req.headers['content-type'] ?? '');
+        const isForm = contentType.includes('application/x-www-form-urlencoded');
+        const fields = isForm ? await readFormBody(req) : await readJsonBody(req);
+        const caseRef = fields.case_ref;
+
+        // Test-only asynchronous rendezvous (armed only by the fresh-case
+        // overlap test on a dedicated instance; undefined everywhere else).
+        // Fires only after session/role/body parsing has passed and
+        // immediately before the synchronous store call; the handler awaits
+        // the returned promise with no database call of any kind in flight
+        // and no write transaction open, so the event loop stays free to
+        // service the overlapping request. When un-armed the store call is
+        // reached directly.
+        if (handoffArrivalRendezvous) {
+          const rendezvousRecord = {
+            seq: ++handoffArrivalSeq,
+            caseRef: caseRef === undefined || caseRef === null ? '' : String(caseRef),
+            wantsHtml: html,
+          };
+          await handoffArrivalRendezvous(rendezvousRecord);
+        }
+
+        // Tolerant resolution (same convention as /cases?case=… and the
+        // /ask-adjacent case routes): an opaque ref that resolves maps to
+        // the record id; anything else is treated as a literal id (unknown
+        // values deny with the same opaque reason inside the store).
+        const result = handoffRenewalToPrescriber(
+          dbPath,
+          identity,
+          resolveCaseRef(dbPath, caseRef === undefined || caseRef === null ? '' : String(caseRef)) ??
+            (caseRef === undefined || caseRef === null ? '' : String(caseRef)),
+          optionsForHandoff
+        );
+
+        if (!result.ok) {
+          switch (result.code) {
+            case 'handoff-save-failed':
+              return html
+                ? sendHtml(res, 503, HANDOFF_SAVE_FAILED_HTML)
+                : sendJson(res, 503, {
+                  ok: false,
+                  error: 'handoff-save-failed',
+                  recoverable: true,
+                  message: 'Your handoff could not be saved. Nothing was changed; please try again.',
+                });
+            case 'not-authorized':
+            default:
+              // Fixed denial: unknown refs, unrelated identities, and
+              // out-of-window records are indistinguishable (no existence,
+              // assignment, or status disclosure).
+              return html
+                ? sendHtml(res, 403, renderAccessDeniedPage({
+                  reason: 'not-authorized',
+                  message: DENIAL_BODIES['not-authorized'].message,
+                }))
+                : sendJson(res, 403, { ...DENIAL_BODIES['not-authorized'] });
+          }
+        }
+
+        // First handoff and replay both return 200 (not 201: the operation
+        // mutates the existing renewal rather than creating a resource).
+        if (html) {
+          // 303 to the case detail: the existing detail view renders the
+          // durable status, handoff time, and next actor — no record data
+          // in the redirect (ask convention).
+          return sendHtml(res, 303, '', { Location: `/cases?case=${caseRefFor(result.renewal.id)}` });
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          code: result.code,
+          handed_off: result.handed_off,
+          renewal: {
+            id: result.renewal.id,
+            status: result.renewal.status,
+            next_actor: result.renewal.next_actor,
+            handoff_at: result.renewal.handoff_at,
+          },
         });
       }
 

@@ -9,6 +9,7 @@ import {
   initDatabase,
   seedSyntheticFixtures,
   seedSyntheticAccounts,
+  caseRefFor,
 } from '../store.mjs';
 import { startServer } from '../server.mjs';
 
@@ -31,6 +32,8 @@ const CASE_DATA_TOKENS = [
   STATUS_LABELS.VISIT_REQUIRED,
   '2026-11-21T08:00:00Z', '2026-11-21T08:30:00Z', '2026-11-21T09:00:00Z',
   '2026-11-21T10:00:00Z',
+  'handoff-view-rx', 'handoff-view-rn',
+  '2026-11-21T11:00:00Z', '2026-11-21T11:30:00Z',
 ];
 
 function assertNoCaseDataHtml(html, label) {
@@ -937,6 +940,233 @@ test('HTML: no rendered page for any role/state contains pickup-ready text (sour
       assertNoPickupReadyHtml(page.text, `rendered page ${label}`);
     }
     assert.ok(pages.length >= 8, 'the scan covered the sign-in, queue, and detail pages for every role');
+  } finally {
+    await app?.close();
+    env.db.close();
+    rmSync(env.dir, { recursive: true, force: true });
+  }
+});
+
+// --- pharmacy handoff form: presence / absence / no scripts ----------------
+
+// The one handoff form the estate renders: a native POST to /handoff whose
+// only field is the stable case_ref and whose control is a native
+// keyboard-operable submit button. Matched as plain HTML attributes — no
+// script involvement.
+const HANDOFF_FORM_RE =
+  /<form method="post" action="\/handoff" aria-label="Request renewal">\s*<input type="hidden" name="case_ref" value="([0-9a-f]{32})">\s*<button type="submit">Request renewal<\/button>\s*<\/form>/;
+
+function assertNoHandoffForm(html, label) {
+  const m = html.match(/<form[^>]*action="\/handoff"/g) ?? [];
+  assert.equal(m.length, 0, `${label}: no handoff form`);
+}
+
+function assertOneHandoffForm(html, label, expectedRef) {
+  const m = html.match(HANDOFF_FORM_RE);
+  assert.ok(m, `${label}: detail page carries a native Request renewal form POSTing to /handoff`);
+  const all = html.match(/<form[^>]*action="\/handoff"/g) ?? [];
+  assert.equal(all.length, 1, `${label}: exactly one handoff form on the page`);
+  assert.equal(m[1], expectedRef, `${label}: the hidden field carries the STABLE case reference`);
+  // No other control type could shadow the submit (no inert button, no
+  // inline handler, no script anywhere on the page).
+  assertNoScriptsOrHandlers(html, label);
+  assert.ok(!/type="button"/.test(html), `${label}: no inert type="button" control`);
+}
+
+function detailUrlForCase(base, caseId) {
+  return `${base}/cases?case=${caseRefFor(caseId)}`;
+}
+
+test('HTML: the pharmacy handoff form renders exactly once for the assigned pharmacy in Sent to pharmacy and never for other roles, the unrelated pharmacy, or other statuses (no inline scripts or handlers)', async () => {
+  const env = makeEnv('handoff-form');
+  let app;
+  try {
+    // A second assigned, still 'Sent to pharmacy' case for the SAME
+    // pharmacy (a fresh prescription + non-final renewal) proves the
+    // presence is not tied to one record id. An extra terminal case for a
+    // different assigned pharmacy adds a second role to the absent-status
+    // scan.
+    env.db.prepare(
+      `INSERT INTO prescriptions (id, patient_id, pharmacy_id, prescriber_id, refills_remaining, is_synthetic)
+       VALUES ('handoff-view-rx', 'ending-b-patient', 'pharmacy-cedar', 'ending-b-prescriber', 0, 1)`
+    ).run();
+    env.db.prepare(
+      `INSERT INTO renewals (id, prescription_id, patient_id, pharmacy_id, prescriber_id, status, next_actor, submitted_at, handoff_at)
+       VALUES ('handoff-view-rn', 'handoff-view-rx', 'ending-b-patient', 'pharmacy-cedar', 'ending-b-prescriber', ?, 'pharmacy', '2026-11-21T11:00:00Z', NULL)`
+    ).run(STATUS_LABELS.SENT_TO_PHARMACY);
+    env.db.prepare(
+      `INSERT INTO renewals (id, prescription_id, patient_id, pharmacy_id, prescriber_id, status, next_actor, submitted_at, handoff_at, decided_at, granted_refills)
+       VALUES ('ending-d-renewal', 'denial-rx', 'denial-patient', 'pharmacy-dunmore', 'denial-prescriber', ?, 'pharmacy', '2026-11-21T11:00:00Z', '2026-11-21T11:30:00Z', '2026-11-21T12:00:00Z', 1)`
+    ).run(STATUS_LABELS.RENEWAL_APPROVED);
+
+    app = await startServer({ dbPath: env.dbPath, host: '127.0.0.1', port: 0 });
+    const base = `http://127.0.0.1:${app.port}`;
+
+    const cedar = await formSignIn(base, 'pharmacy.cedar', 'pharmacy-cedar-2026');
+    const dunmore = await formSignIn(base, 'pharmacy.dunmore', 'pharmacy-dunmore-2026');
+    const boris = await formSignIn(base, 'boris.laine', 'patient-boris-2026');
+    const priya = await formSignIn(base, 'dr.priya.raman', 'prescriber-priya-2026');
+    const emil = await formSignIn(base, 'dr.emil.hart', 'prescriber-emil-2026');
+
+    // Whole-table state reference BEFORE any page is read (the denial and
+    // absence sections must not change durable state).
+    const snapshot = (table, order) =>
+      env.db.prepare(`SELECT * FROM ${table} ORDER BY ${order}`).all().map((r) => Object.values(r));
+    const before = {
+      sessions: snapshot('sessions', 'token'),
+      identities: snapshot('identities', 'id'),
+      prescriptions: snapshot('prescriptions', 'id'),
+      renewals: snapshot('renewals', 'id'),
+      renewal_events: snapshot('renewal_events', 'id'),
+      pharmacy_conversation_messages: snapshot('pharmacy_conversation_messages', 'id'),
+      office_messages: snapshot('office_messages', 'id'),
+      phone_notes: snapshot('phone_notes', 'id'),
+      synthetic_accounts: snapshot('synthetic_accounts', 'username'),
+      markers: snapshot('markers', 'key'),
+    };
+    assert.equal(before.renewals.length, 4, 'reference includes the two seeded fixture cases + two added view cases');
+    assert.equal(before.renewal_events.length, 0, 'no event rows exist before the view checks');
+
+    const refB = caseRefFor('ending-b-renewal');
+    const refView = caseRefFor('handoff-view-rn');
+
+    // --- PRESENCE 1: the assigned pharmacy on a 'Sent to pharmacy' case --
+    const bDetail = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: cedar.cookieHeader } });
+    assert.equal(bDetail.res.status, 200, 'assigned pharmacy reads the Sent to pharmacy case');
+    assertClearHeading(bDetail.text, 'cedar detail b', 'Pharmacy case: Boris Laine');
+    assertNoPickupReadyHtml(bDetail.text, 'cedar detail b');
+    assertNoScriptsOrHandlers(bDetail.text, 'cedar detail b');
+    assertOneHandoffForm(bDetail.text, 'cedar detail b (ending-b-renewal)', refB);
+    // The page still shows the saved pre-handoff state next to the form.
+    assert.equal(definitionValue(bDetail.text, 'Status'), STATUS_LABELS.SENT_TO_PHARMACY, 'detail b shows the saved status');
+    assert.equal(definitionValue(bDetail.text, 'Next actor'), 'Pharmacy', 'detail b shows the saved next actor');
+    assert.equal(definitionValue(bDetail.text, 'Handoff at'), 'Not recorded', 'detail b shows no handoff time yet');
+
+    // --- PRESENCE 2: the other assigned 'Sent to pharmacy' case ----------
+    const viewDetail = await fetchHtml(detailUrlForCase(base, 'handoff-view-rn'), { headers: { Cookie: cedar.cookieHeader } });
+    assert.equal(viewDetail.res.status, 200, 'assigned pharmacy reads the second Sent to pharmacy case');
+    assertOneHandoffForm(viewDetail.text, 'cedar detail (handoff-view-rn)', refView);
+    assert.equal(definitionValue(viewDetail.text, 'Status'), STATUS_LABELS.SENT_TO_PHARMACY, 'detail view shows the saved status');
+
+    // --- ABSENCE: prescriber role (assigned prescriber, same case) -------
+    const bDetailPrescriber = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: priya.cookieHeader } });
+    assert.equal(bDetailPrescriber.res.status, 200, 'assigned prescriber reads the same case');
+    assertClearHeading(bDetailPrescriber.text, 'priya detail b', 'Prescriber case: Boris Laine');
+    assertNoScriptsOrHandlers(bDetailPrescriber.text, 'priya detail b');
+    assertNoHandoffForm(bDetailPrescriber.text, 'priya detail b (prescriber role)');
+    assert.equal(definitionValue(bDetailPrescriber.text, 'Status'), STATUS_LABELS.SENT_TO_PHARMACY, 'prescriber detail shows the saved status');
+
+    // --- ABSENCE: patient role (the case patient) -------------------------
+    const bDetailPatient = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: boris.cookieHeader } });
+    assert.equal(bDetailPatient.res.status, 200, 'case patient reads the same case');
+    assertNoScriptsOrHandlers(bDetailPatient.text, 'boris detail b');
+    assertNoHandoffForm(bDetailPatient.text, 'boris detail b (patient role)');
+    assert.equal(definitionValue(bDetailPatient.text, 'Status'), STATUS_LABELS.SENT_TO_PHARMACY, 'patient detail shows the saved status');
+
+    // --- ABSENCE: the unrelated pharmacy (denied before render) ----------
+    const bDetailUnrelated = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: dunmore.cookieHeader } });
+    assert.equal(bDetailUnrelated.res.status, 403, 'unrelated pharmacy is denied the case before any render');
+    assertClearHeading(bDetailUnrelated.text, 'dunmore denial', 'Access denied');
+    assertNoCaseDataHtml(bDetailUnrelated.text, 'dunmore denial page');
+    assertNoScriptsOrHandlers(bDetailUnrelated.text, 'dunmore denial page');
+    assertNoHandoffForm(bDetailUnrelated.text, 'dunmore denial page (unrelated pharmacy)');
+
+    // --- ABSENCE: the unrelated prescriber (denied before render) --------
+    const bDetailUnrelatedPresc = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: emil.cookieHeader } });
+    assert.equal(bDetailUnrelatedPresc.res.status, 403, 'unrelated prescriber is denied the case before any render');
+    assertNoScriptsOrHandlers(bDetailUnrelatedPresc.text, 'emil denial page');
+    assertNoHandoffForm(bDetailUnrelatedPresc.text, 'emil denial page (unrelated prescriber)');
+
+    // --- ABSENCE: any non-'Sent to pharmacy' status ----------------------
+    // Cedar's approved terminal case: the pharmacy still reads it, but the
+    // form is withheld because the status is no longer 'Sent to pharmacy'.
+    const aDetail = await fetchHtml(`${base}/cases?case=${caseRefFor('ending-a-renewal')}`, { headers: { Cookie: cedar.cookieHeader } });
+    assert.equal(aDetail.res.status, 200, 'pharmacy reads the approved terminal case');
+    assertNoScriptsOrHandlers(aDetail.text, 'cedar detail a');
+    assertNoHandoffForm(aDetail.text, 'cedar detail a (Renewal approved status)');
+    assert.equal(definitionValue(aDetail.text, 'Status'), STATUS_LABELS.RENEWAL_APPROVED, 'detail a shows the approved status');
+    assert.equal(definitionValue(aDetail.text, 'Handoff at'), '2026-11-21T08:30:00Z', 'detail a shows the saved handoff time');
+    // Dunmore's approved terminal case: a second role with a non-Sent status.
+    const dDetail = await fetchHtml(`${base}/cases?case=${caseRefFor('ending-d-renewal')}`, { headers: { Cookie: dunmore.cookieHeader } });
+    assert.equal(dDetail.res.status, 200, 'dunmore reads its approved terminal case');
+    assertNoScriptsOrHandlers(dDetail.text, 'dunmore detail d');
+    assertNoHandoffForm(dDetail.text, 'dunmore detail d (Renewal approved status)');
+    assert.equal(definitionValue(dDetail.text, 'Status'), STATUS_LABELS.RENEWAL_APPROVED, 'detail d shows the approved status');
+
+    // --- PRESENCE (UI-driven): submit the rendered form as a browser would
+    //     (native form POST of the hidden case_ref), then the same durable
+    //     page shows the saved state and NO handoff form (the status is no
+    //     longer 'Sent to pharmacy').
+    const form = bDetail.text.match(HANDOFF_FORM_RE);
+    assert.ok(form, 'the cedar detail b page still carries the handoff form before submission');
+    const submittedRef = form[1];
+    const formPost = await fetch(`${base}/handoff`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { ...HTML, Cookie: cedar.cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `case_ref=${encodeURIComponent(submittedRef)}`,
+    });
+    assert.equal(formPost.status, 303, 'native form POST to /handoff redirects on success');
+    assert.equal(formPost.headers.get('location'), `/cases?case=${refB}`, 'the form POST lands back on the stable case detail URL');
+    const afterRow = env.db.prepare(`SELECT status, next_actor, handoff_at, version FROM renewals WHERE id = 'ending-b-renewal'`).get();
+    assert.equal(afterRow.status, STATUS_LABELS.AWAITING_PRESCRIBER, 'the form POST durably handed off the case');
+    assert.equal(afterRow.next_actor, 'prescriber', 'the form POST set the prescriber as next actor');
+    assert.ok(typeof afterRow.handoff_at === 'string' && afterRow.handoff_at.length > 0, 'the form POST recorded a handoff time');
+    assert.equal(env.db.prepare(`SELECT COUNT(*) AS n FROM renewal_events WHERE renewal_id = 'ending-b-renewal' AND event_type = 'handoff'`).get().n, 1, 'the form POST recorded exactly one handoff event');
+
+    const bDetailAfter = await fetchHtml(detailUrlForCase(base, 'ending-b-renewal'), { headers: { Cookie: cedar.cookieHeader } });
+    assert.equal(bDetailAfter.res.status, 200, 'the same case detail re-renders after the handoff');
+    assertClearHeading(bDetailAfter.text, 'cedar detail b after', 'Pharmacy case: Boris Laine');
+    assertNoScriptsOrHandlers(bDetailAfter.text, 'cedar detail b after');
+    assertNoPickupReadyHtml(bDetailAfter.text, 'cedar detail b after');
+    assertNoHandoffForm(bDetailAfter.text, 'cedar detail b after handoff (status is no longer Sent to pharmacy)');
+    assert.equal(definitionValue(bDetailAfter.text, 'Status'), STATUS_LABELS.AWAITING_PRESCRIBER, 'after handoff the detail shows Awaiting prescriber');
+    assert.equal(definitionValue(bDetailAfter.text, 'Next actor'), 'Prescriber', 'after handoff the detail shows the prescriber next actor');
+    assert.equal(definitionValue(bDetailAfter.text, 'Handoff at'), afterRow.handoff_at, 'after handoff the detail shows the saved handoff time');
+    // The seeded second 'Sent to pharmacy' case still offers its own form.
+    const viewDetailAfter = await fetchHtml(detailUrlForCase(base, 'handoff-view-rn'), { headers: { Cookie: cedar.cookieHeader } });
+    assert.equal(viewDetailAfter.res.status, 200, 'the second case is unaffected');
+    assertOneHandoffForm(viewDetailAfter.text, 'cedar detail (handoff-view-rn) after the other handoff', refView);
+
+    // --- Durable state: reads + denials changed nothing except the one UI
+    //     handoff performed above (its single renewal-row update + single
+    //     handoff event). The queue/detail READS and every DENIAL in this
+    //     test made no durable change; only the UI-driven form POST did.
+    const after = {
+      sessions: snapshot('sessions', 'token'),
+      identities: snapshot('identities', 'id'),
+      prescriptions: snapshot('prescriptions', 'id'),
+      renewals: snapshot('renewals', 'id'),
+      renewal_events: snapshot('renewal_events', 'id'),
+      pharmacy_conversation_messages: snapshot('pharmacy_conversation_messages', 'id'),
+      office_messages: snapshot('office_messages', 'id'),
+      phone_notes: snapshot('phone_notes', 'id'),
+      synthetic_accounts: snapshot('synthetic_accounts', 'username'),
+      markers: snapshot('markers', 'key'),
+    };
+    // Tables that must be byte-identical (no form is ever rendered to a
+    // denial, and reads are read-only).
+    for (const table of ['identities', 'prescriptions', 'phone_notes', 'office_messages', 'pharmacy_conversation_messages', 'synthetic_accounts', 'markers']) {
+      assert.deepEqual(after[table], before[table], `${table}: the handoff-form view checks make no durable-state change`);
+    }
+    assert.equal(after.renewals.length, before.renewals.length, 'no renewal row was created');
+    // Exactly one renewal row (ending-b-renewal) changed: its status, next
+    // actor, handoff time, and version from the one UI-driven handoff.
+    const beforeB = before.renewals.find((r) => r[0] === 'ending-b-renewal');
+    const afterB = after.renewals.find((r) => r[0] === 'ending-b-renewal');
+    assert.equal(afterB[5], afterRow.status, 'ending-b-renewal status is now Awaiting prescriber');
+    assert.notDeepEqual(beforeB, afterB, 'ending-b-renewal changed exactly once (the handoff)');
+    // Every other renewal row is byte-identical to the reference.
+    for (let i = 0; i < after.renewals.length; i += 1) {
+      if (after.renewals[i][0] !== 'ending-b-renewal') {
+        assert.deepEqual(after.renewals[i], before.renewals[i], `${after.renewals[i][0]}: unchanged by the view checks`);
+      }
+    }
+    // Exactly one handoff event now exists — the one from the UI handoff.
+    assert.equal(after.renewal_events.length, 1, 'exactly one handoff event after the UI handoff');
+    assert.equal(after.renewal_events[0][1], 'ending-b-renewal', 'the single event is for the handed-off case');
+    assert.equal(after.renewal_events[0][2], 'handoff', 'the single event is a handoff event');
+    assert.equal(after.renewal_events[0][5], afterRow.handoff_at, 'the single event carries the handoff time');
   } finally {
     await app?.close();
     env.db.close();
