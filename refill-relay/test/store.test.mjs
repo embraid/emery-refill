@@ -20,6 +20,7 @@ import {
   handleAppRequest,
   writeMarker,
   readMarker,
+  handoffRenewalToPrescriber,
 } from '../store.mjs';
 
 // --- helpers ---------------------------------------------------------------
@@ -1509,6 +1510,628 @@ test('sign-in: injected session-persistence failure after INSERT before COMMIT i
     assert.equal(recoveredSession.identity.id, 'ending-b-prescriber');
   } finally {
     db?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+// --- pharmacy handoff store transaction ------------------------------------
+
+// The assigned responsible pharmacy for the fixture handoff cases.
+const HANDOFF_PHARMACY = Object.freeze({ id: 'pharmacy-cedar', role: 'pharmacy' });
+
+// Fresh handoff target: a synthetic zero-refill 'Sent to pharmacy' renewal
+// for the seeded Ending B identities — the exact RFRLM-FR-001 pre-handoff
+// shape, on ids the fixture set does not use, so the fixture rehearsal
+// case is never mutated by the handoff tests.
+const HANDOFF_TARGET = Object.freeze({
+  rx: 'handoff-rx',
+  rn: 'handoff-rn',
+  patient: 'ending-b-patient',
+  pharmacy: 'pharmacy-cedar',
+  prescriber: 'ending-b-prescriber',
+});
+
+function seedHandoffTarget(dbPath, { prescriptionId = HANDOFF_TARGET.rx, renewalId = HANDOFF_TARGET.rn } = {}) {
+  const db = initDatabase(dbPath);
+  try {
+    db.prepare(
+      `INSERT INTO prescriptions (id, patient_id, pharmacy_id, prescriber_id, refills_remaining, is_synthetic)
+       VALUES (?, ?, ?, ?, 0, 1)`
+    ).run(prescriptionId, HANDOFF_TARGET.patient, HANDOFF_TARGET.pharmacy, HANDOFF_TARGET.prescriber);
+    db.prepare(
+      `INSERT INTO renewals
+         (id, prescription_id, patient_id, pharmacy_id, prescriber_id,
+          status, next_actor, submitted_at, handoff_at, decided_at,
+          granted_refills, request_idempotency_key, version)
+       VALUES (?, ?, ?, ?, ?, ?, 'pharmacy', '2026-11-21T12:00:00Z', NULL, NULL, NULL, NULL, 1)`
+    ).run(
+      renewalId,
+      prescriptionId,
+      HANDOFF_TARGET.patient,
+      HANDOFF_TARGET.pharmacy,
+      HANDOFF_TARGET.prescriber,
+      STATUS_LABELS.SENT_TO_PHARMACY
+    );
+  } finally {
+    db.close();
+  }
+}
+
+// Scalar-only snapshot of every data table (normalized to arrays of scalar
+// values, never raw SQLite rows) for before/after durable-state equality —
+// the patient-request store test's fullTableState convention.
+function handoffTableState(dbPath) {
+  const db = initDatabase(dbPath);
+  try {
+    const snapshot = (table, orderExpr) =>
+      db
+        .prepare(`SELECT * FROM ${table} ORDER BY ${orderExpr}`)
+        .all()
+        .map((r) => Object.values(r));
+    return {
+      markers: snapshot('markers', 'key'),
+      identities: snapshot('identities', 'id'),
+      prescriptions: snapshot('prescriptions', 'id'),
+      renewals: snapshot('renewals', 'id'),
+      renewal_events: snapshot('renewal_events', 'id'),
+      pharmacy_conversation_messages: snapshot('pharmacy_conversation_messages', 'id'),
+      office_messages: snapshot('office_messages', 'id'),
+      phone_notes: snapshot('phone_notes', 'id'),
+      sessions: snapshot('sessions', 'token'),
+      synthetic_accounts: snapshot('synthetic_accounts', 'username'),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function assertHandoffStateUnchanged(after, before, label) {
+  for (const table of Object.keys(before)) {
+    assert.deepEqual(
+      after[table],
+      before[table],
+      `${label}: table ${table} unchanged`
+    );
+  }
+}
+
+// The plan's exact fixed denial: the full outcome is this object and
+// nothing else — no status detail, no case field, no error text, no lock
+// counter. Every handoff denial must be deepEqual to it.
+const handoffDenial = { ok: false, code: 'not-authorized' };
+
+test('handoff: first handoff durably transitions the same renewal once, sets next actor + handoff time + version, records exactly one handoff event, and changes nothing else', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  let db;
+  try {
+    db = initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedSyntheticAccounts(dbPath);
+    seedHandoffTarget(dbPath);
+
+    const before = handoffTableState(dbPath);
+    assert.equal(
+      db.prepare(`SELECT version FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn).version,
+      1,
+      'precondition: fresh case at version 1'
+    );
+    assert.equal(
+      db.prepare(`SELECT handoff_at FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn).handoff_at,
+      null,
+      'precondition: no handoff time before the first handoff'
+    );
+
+    // The authorized first handoff, by the assigned responsible pharmacy.
+    const res = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.equal(res.ok, true, 'first handoff succeeds');
+    assert.equal(res.code, 'handed-off', 'first handoff outcome code');
+    assert.equal(res.handed_off, true, 'outcome marks the case handed off');
+    assert.equal(res.renewal.id, HANDOFF_TARGET.rn, 'the SAME renewal row is returned');
+    assert.equal(res.renewal.status, STATUS_LABELS.AWAITING_PRESCRIBER);
+    assert.equal(res.renewal.next_actor, 'prescriber', 'next actor is the prescriber role');
+    assert.ok(res.renewal.handoff_at, 'handoff_at present');
+    assert.match(res.renewal.handoff_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, 'handoff_at is a UTC ISO-8601 timestamp');
+    assert.equal(res.renewal.version, 2, 'version bumped by exactly one');
+    assert.equal(res.renewal.pharmacy_id, HANDOFF_TARGET.pharmacy, 'pharmacy assignment unchanged');
+    assert.equal(res.renewal.prescriber_id, HANDOFF_TARGET.prescriber, 'prescriber assignment unchanged');
+    assert.equal(res.renewal.decided_at, null, 'no decision fields are written by a handoff');
+    assert.equal(res.renewal.granted_refills, null);
+
+    // Durability re-read on a fresh connection (the handoff's own
+    // connection is closed): exactly one transition and one event.
+    const check = initDatabase(dbPath);
+    try {
+      const row = check.prepare(`SELECT * FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn);
+      assert.equal(row.status, STATUS_LABELS.AWAITING_PRESCRIBER, 'durable status is Awaiting prescriber');
+      assert.equal(row.next_actor, 'prescriber', 'durable next actor is the prescriber role');
+      assert.equal(row.handoff_at, res.renewal.handoff_at, 'durable handoff_at matches the response');
+      assert.ok(!Number.isNaN(Date.parse(row.handoff_at)), 'durable handoff_at is ISO-8601');
+      assert.equal(row.version, 2, 'durable version is exactly +1 (1 -> 2)');
+      assert.equal(row.pharmacy_id, HANDOFF_TARGET.pharmacy, 'pharmacy assignment unchanged durably');
+      assert.equal(row.prescriber_id, HANDOFF_TARGET.prescriber, 'prescriber assignment unchanged durably');
+      assert.equal(row.submitted_at, '2026-11-21T12:00:00Z', 'original submitted_at preserved');
+      assert.equal(row.decided_at, null, 'no decided_at written');
+      assert.equal(row.granted_refills, null, 'no granted_refills written');
+
+      const events = check
+        .prepare(`SELECT * FROM renewal_events WHERE renewal_id = ? ORDER BY id`)
+        .all(HANDOFF_TARGET.rn);
+      assert.equal(events.length, 1, 'exactly one handoff event, none other');
+      assert.equal(events[0].event_type, EVENT_TYPES.HANDOFF, 'event type is handoff');
+      assert.equal(events[0].occurred_at, row.handoff_at, 'event time is the handoff time');
+      assert.equal(events[0].actor_role, 'pharmacy', 'event actor role is the acting pharmacy role');
+      assert.equal(events[0].actor_id, HANDOFF_PHARMACY.id, 'event actor is the acting pharmacy identity');
+
+      // Nothing else changed: the prescription's zero-refill condition,
+      // every workflow table, and every other row are byte-identical to
+      // the before-state (the only renewal-row delta is this one update).
+      const after = handoffTableState(dbPath);
+      assert.equal(
+        after.prescriptions.find((r) => r[0] === HANDOFF_TARGET.rx)[4],
+        0,
+        'refills_remaining is untouched (still zero)'
+      );
+      assert.equal(after.renewals.length, before.renewals.length, 'no new renewal row');
+      assert.equal(
+        after.renewal_events.length,
+        before.renewal_events.length + 1,
+        'renewal_events grew by exactly one row'
+      );
+      for (const table of [
+        'markers', 'identities', 'pharmacy_conversation_messages',
+        'office_messages', 'phone_notes', 'sessions', 'synthetic_accounts',
+      ]) {
+        assert.deepEqual(after[table], before[table], `${table} unchanged`);
+      }
+      // The single renewal-row delta is exactly the handoff update itself.
+      const otherRenewals = after.renewals.filter((r) => r[0] !== HANDOFF_TARGET.rn);
+      assert.deepEqual(otherRenewals, before.renewals.filter((r) => r[0] !== HANDOFF_TARGET.rn), 'all other renewal rows unchanged');
+      const [handedOffScalars] = after.renewals.filter((r) => r[0] === HANDOFF_TARGET.rn);
+      const [beforeTarget] = before.renewals.filter((r) => r[0] === HANDOFF_TARGET.rn);
+      const expected = [...beforeTarget];
+      const cols = ['id', 'prescription_id', 'patient_id', 'pharmacy_id', 'prescriber_id', 'status', 'next_actor', 'submitted_at', 'handoff_at', 'decided_at', 'granted_refills', 'request_idempotency_key', 'version'];
+      expected[cols.indexOf('status')] = STATUS_LABELS.AWAITING_PRESCRIBER;
+      expected[cols.indexOf('next_actor')] = 'prescriber';
+      expected[cols.indexOf('handoff_at')] = row.handoff_at;
+      expected[cols.indexOf('version')] = 2;
+      assert.deepEqual(handedOffScalars, expected, 'the single renewal-row delta is exactly the handoff update');
+    } finally {
+      check.close();
+    }
+  } finally {
+    db?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('handoff: replay is idempotent — same case state, original handoff time, still exactly one event, zero new rows', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  try {
+    initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedHandoffTarget(dbPath);
+
+    // The committed first handoff, then a sequential replay (the story's
+    // retry-after-success case).
+    const first = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.equal(first.ok, true, 'first handoff succeeds');
+    assert.equal(first.code, 'handed-off');
+
+    const afterFirst = handoffTableState(dbPath);
+    const replay = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    // Full-outcome check: the replay is exactly the idempotent shape —
+    // the same saved renewal (original handoff time, no second version
+    // increment), no second event, no extra fields.
+    assert.deepEqual(
+      replay,
+      {
+        ok: true,
+        code: 'already-handed-off',
+        handed_off: true,
+        renewal: first.renewal,
+        lockRetries: 0,
+      },
+      'replay returns the full idempotent outcome with the saved renewal unchanged'
+    );
+    assert.equal(replay.renewal.handoff_at, first.renewal.handoff_at, 'original first valid handoff timestamp preserved');
+    assert.equal(replay.renewal.version, first.renewal.version, 'no second version increment');
+
+    // Durability: the replay added nothing — no second event, no row
+    // delta of any kind, and the original handoff time is intact.
+    const afterReplay = handoffTableState(dbPath);
+    assert.deepEqual(afterReplay, afterFirst, 'replay left every table byte-identical');
+    const check = initDatabase(dbPath);
+    try {
+      assert.equal(
+        check
+          .prepare(`SELECT COUNT(*) AS n FROM renewal_events WHERE renewal_id = ? AND event_type = ?`)
+          .get(HANDOFF_TARGET.rn, EVENT_TYPES.HANDOFF).n,
+        1,
+        'still exactly one handoff event after the replay'
+      );
+      const row = check.prepare(`SELECT handoff_at, version FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn);
+      assert.equal(row.handoff_at, first.renewal.handoff_at, 'durable original handoff_at preserved');
+      assert.equal(row.version, 2, 'durable version still exactly 2');
+    } finally {
+      check.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('handoff denials: non-pharmacy roles, missing id, unknown id, unrelated pharmacy, lost ownership, and unassigned prescriber all return the exact fixed not-authorized denial, disclose no case data, and leave the rejected cases unchanged', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  try {
+    initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedSyntheticAccounts(dbPath);
+    seedHandoffTarget(dbPath);
+
+    const before = handoffTableState(dbPath);
+    const sessionsBefore = before.sessions.length;
+
+    const denials = [
+      ['prescriber role', HANDOFF_TARGET.rn, { id: HANDOFF_TARGET.prescriber, role: 'prescriber' }],
+      ['patient role', HANDOFF_TARGET.rn, { id: HANDOFF_TARGET.patient, role: 'patient' }],
+      ['unknown role', HANDOFF_TARGET.rn, { id: HANDOFF_TARGET.pharmacy, role: 'clinic' }],
+      ['missing id', HANDOFF_TARGET.rn, { id: '', role: 'pharmacy' }],
+      ['null identity', HANDOFF_TARGET.rn, null],
+      ['unknown renewal id', 'no-such-renewal', { id: HANDOFF_TARGET.pharmacy, role: 'pharmacy' }],
+      ['unrelated pharmacy', HANDOFF_TARGET.rn, { id: 'pharmacy-dunmore', role: 'pharmacy' }],
+    ];
+
+    for (const [label, renewalId, identity] of denials) {
+      const res = handoffRenewalToPrescriber(dbPath, identity, renewalId);
+      // Full-outcome check: the denial is exactly the plan's fixed shape —
+      // no case field (status, time, id, or assignment), no status detail,
+      // no lock counter.
+      assert.deepEqual(res, handoffDenial, `${label}: exact fixed not-authorized denial`);
+    }
+
+    // An unknown id and an unrelated id are byte-identical: no existence
+    // or assignment disclosure (same discipline as getRoleCase).
+    const unknown = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, 'no-such-renewal');
+    const unrelated = handoffRenewalToPrescriber(dbPath, { id: 'pharmacy-dunmore', role: 'pharmacy' }, HANDOFF_TARGET.rn);
+    assert.deepEqual(unknown, unrelated, 'unknown and unrelated denials are byte-identical');
+
+    // The pre-lock denials wrote nothing: full durable state on a fresh
+    // connection is byte-identical.
+    const afterPreLock = handoffTableState(dbPath);
+    assertHandoffStateUnchanged(afterPreLock, before, 'pre-lock denials');
+    assert.equal(afterPreLock.sessions.length, sessionsBefore, 'sessions count unchanged');
+    assert.equal(afterPreLock.renewal_events.length, 0, 'no events from the pre-lock denials');
+
+    // Under-lock ineligibility: the pre-lock check passes (the row exists
+    // and was assigned to the acting pharmacy), but the freshly locked row
+    // must still be verified — the acting pharmacy still owns the case and
+    // a prescriber is still assigned — before either returning a replay or
+    // making the transition.
+    const mutate = initDatabase(dbPath);
+    try {
+      mutate
+        .prepare(`UPDATE renewals SET pharmacy_id = ? WHERE id = ?`)
+        .run('pharmacy-dunmore', HANDOFF_TARGET.rn);
+    } finally {
+      mutate.close();
+    }
+    const lostOwnership = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(lostOwnership, handoffDenial, 'lost ownership under the lock: exact fixed denial');
+
+    const mutate2 = initDatabase(dbPath);
+    try {
+      mutate2
+        .prepare(`UPDATE renewals SET prescriber_id = '' WHERE id = ?`)
+        .run(HANDOFF_TARGET.rn);
+    } finally {
+      mutate2.close();
+    }
+    // State after the test's own two ineligibility mutations: the
+    // rejected attempts must leave this byte-identical.
+    const afterMutations = handoffTableState(dbPath);
+    const unassigned = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(unassigned, handoffDenial, 'unassigned prescriber under the lock: exact fixed denial');
+
+    // The rejected cases are unchanged by the rejected attempts: on a
+    // fresh connection, every table is byte-identical to the state just
+    // after the two ineligibility mutations the test itself made — no
+    // status transition, no handoff time, no version bump, no event.
+    const after = handoffTableState(dbPath);
+    assertHandoffStateUnchanged(after, afterMutations, 'under-lock denials');
+    assert.equal(after.renewal_events.length, 0, 'no events from the rejected attempts');
+
+    // Restoring eligibility, the same assigned pharmacy still hands the
+    // case off exactly once — the denials changed nothing that the handoff
+    // depends on.
+    const restore = initDatabase(dbPath);
+    try {
+      restore
+        .prepare(`UPDATE renewals SET pharmacy_id = ?, prescriber_id = ? WHERE id = ?`)
+        .run(HANDOFF_TARGET.pharmacy, HANDOFF_TARGET.prescriber, HANDOFF_TARGET.rn);
+    } finally {
+      restore.close();
+    }
+    const res = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.equal(res.ok, true, 'the case is still handable after the denials');
+    assert.equal(res.code, 'handed-off');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('handoff invalid state: a renewal outside the handoff window (final status) is a fixed denial with no event and no state change', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  try {
+    initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedHandoffTarget(dbPath);
+
+    // Push the fresh case to a final status directly (the store function
+    // never writes final states; this simulates a record that is no longer
+    // in the handoff window).
+    const mutate = initDatabase(dbPath);
+    try {
+      mutate
+        .prepare(
+          `UPDATE renewals
+              SET status = ?, granted_refills = 1, decided_at = '2026-11-21T14:00:00Z'
+            WHERE id = ?`
+        )
+        .run(STATUS_LABELS.RENEWAL_APPROVED, HANDOFF_TARGET.rn);
+    } finally {
+      mutate.close();
+    }
+
+    const before = handoffTableState(dbPath);
+    const res = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    // The plan's exact fixed denial for an out-of-window row: the full
+    // outcome is this object — no status detail, no case data, no lock
+    // counter.
+    assert.deepEqual(res, handoffDenial, 'exact fixed denial for a final-status row');
+
+    const after = handoffTableState(dbPath);
+    assertHandoffStateUnchanged(after, before, 'invalid-state denial');
+    assert.equal(
+      after.renewal_events.length,
+      0,
+      'no event for a denial'
+    );
+
+    // Eligibility variations on an out-of-window row (the under-lock
+    // re-read must apply the same eligibility check to ineligible rows
+    // before either returning a replay or making the transition):
+    // lost ownership and an unassigned prescriber on a committed
+    // 'Awaiting prescriber' row are both the exact same fixed denial —
+    // never a replay of the committed winner.
+    const mutateOwner = initDatabase(dbPath);
+    try {
+      mutateOwner
+        .prepare(`UPDATE renewals SET pharmacy_id = ? WHERE id = ?`)
+        .run('pharmacy-dunmore', HANDOFF_TARGET.rn);
+    } finally {
+      mutateOwner.close();
+    }
+    const resLost = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(resLost, handoffDenial, 'lost ownership on an awaiting row: exact fixed denial');
+
+    const mutatePrescriber = initDatabase(dbPath);
+    try {
+      mutatePrescriber
+        .prepare(`UPDATE renewals SET prescriber_id = '' WHERE id = ?`)
+        .run(HANDOFF_TARGET.rn);
+    } finally {
+      mutatePrescriber.close();
+    }
+    const resUnassigned = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(resUnassigned, handoffDenial, 'unassigned prescriber on an awaiting row: exact fixed denial');
+
+    const afterVariants = handoffTableState(dbPath);
+    assert.equal(afterVariants.renewal_events.length, 0, 'no events for the eligibility-variant denials');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('handoff failed commit: real UPDATE + INSERT then rollback leaves zero partial rows, prior state byte-identical on fresh re-read, and the next handoff succeeds with exactly one event', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  try {
+    initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedSyntheticAccounts(dbPath);
+    seedHandoffTarget(dbPath);
+
+    // Previous saved state: a committed session for the acting pharmacy.
+    const session = signIn(dbPath, 'pharmacy.cedar', 'pharmacy-cedar-2026');
+    assert.equal(session.status, 200, 'previous committed session exists');
+
+    const before = handoffTableState(dbPath);
+    assert.equal(before.sessions.length, 1, 'one committed session in the before-state');
+    assert.equal(before.renewal_events.length, 0, 'no events before the failed handoff');
+
+    // Inject the failure AFTER the real UPDATE + event INSERT and BEFORE
+    // the COMMIT: the writes run, then the transaction rolls back.
+    const failed = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn, {
+      failHandoffCommit: true,
+    });
+    // Full-outcome check: the failure is exactly the recoverable shape —
+    // no handed-off marker, no record value, no lock counter (no
+    // contention was involved in this single-writer seam).
+    assert.deepEqual(
+      failed,
+      { ok: false, code: 'handoff-save-failed', recoverable: true, lockRetries: 0 },
+      'failed commit returns the exact recoverable save-failure outcome'
+    );
+
+    // Reread on a fresh connection: the attempted transition and event are
+    // both gone — the rollback removed both — and every table is
+    // byte-identical to the before-state (the prior saved state is what a
+    // refresh would show).
+    const after = handoffTableState(dbPath);
+    assertHandoffStateUnchanged(after, before, 'failed handoff rollback');
+    const fresh = initDatabase(dbPath);
+    try {
+      const row = fresh.prepare(`SELECT * FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn);
+      assert.equal(row.status, STATUS_LABELS.SENT_TO_PHARMACY, 'the case remains in Sent to pharmacy after the failed save');
+      assert.equal(row.handoff_at, null, 'no partial handoff time');
+      assert.equal(row.version, 1, 'no partial version bump');
+      assert.equal(row.next_actor, 'pharmacy', 'next actor unchanged');
+      assert.equal(
+        fresh
+          .prepare(`SELECT COUNT(*) AS n FROM renewal_events WHERE renewal_id = ?`)
+          .get(HANDOFF_TARGET.rn).n,
+        0,
+        'no partial handoff event from the failed commit'
+      );
+      assert.equal(
+        fresh.prepare(`SELECT COUNT(*) AS n FROM sessions`).get().n,
+        before.sessions.length,
+        'sessions count unchanged after the failed handoff'
+      );
+    } finally {
+      fresh.close();
+    }
+
+    // Recovery: the next handoff (no fault injected) succeeds and commits
+    // exactly one transition and one event.
+    const retry = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.equal(retry.ok, true, 'recovery: the next handoff succeeds');
+    assert.equal(retry.code, 'handed-off');
+    assert.equal(retry.renewal.status, STATUS_LABELS.AWAITING_PRESCRIBER);
+    assert.equal(retry.renewal.version, 2);
+    const check = initDatabase(dbPath);
+    try {
+      assert.equal(
+        check
+          .prepare(`SELECT COUNT(*) AS n FROM renewal_events WHERE renewal_id = ? AND event_type = ?`)
+          .get(HANDOFF_TARGET.rn, EVENT_TYPES.HANDOFF).n,
+        1,
+        'recovery: exactly one handoff event after the successful retry'
+      );
+      assert.equal(
+        check.prepare(`SELECT handoff_at FROM renewals WHERE id = ?`).get(HANDOFF_TARGET.rn).handoff_at,
+        retry.renewal.handoff_at,
+        'recovery: the durable handoff time is the retried handoff\'s first valid time'
+      );
+    } finally {
+      check.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('handoff unique-index backstop: a committed handoff event on a not-yet-transitioned row blocks the second event; the store returns the committed winner idempotently, or a recoverable save failure without one', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refill-relay-fixture-'));
+  const dbPath = join(dir, 'fixture.sqlite');
+  try {
+    initDatabase(dbPath);
+    seedSyntheticFixtures(dbPath);
+    seedHandoffTarget(dbPath);
+
+    const winnerAt = '2026-11-21T13:00:00Z';
+
+    // Corrupt winner state (pathological double-writer): a committed
+    // handoff event exists, but the renewal row was never transitioned.
+    // The one-handoff partial unique index is already taken.
+    const corrupt = initDatabase(dbPath);
+    try {
+      corrupt
+        .prepare(
+          `INSERT INTO renewal_events (renewal_id, event_type, actor_role, actor_id, occurred_at, payload)
+           VALUES (?, ?, 'pharmacy', ?, ?, ?)`
+        )
+        .run(HANDOFF_TARGET.rn, EVENT_TYPES.HANDOFF, HANDOFF_PHARMACY.id, winnerAt, '{"synthetic":true}');
+    } finally {
+      corrupt.close();
+    }
+
+    // The store function's own event INSERT violates
+    // renewal_events_one_handoff; the defense-in-depth UNIQUE catch finds
+    // no eligible committed winner (the row was never transitioned), so
+    // the outcome is the exact recoverable save failure. ROLLBACK: no
+    // partial state, and the pre-existing event is untouched.
+    const before = handoffTableState(dbPath);
+    const blocked = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(
+      blocked,
+      { ok: false, code: 'handoff-save-failed', recoverable: true, lockRetries: 0 },
+      'no eligible committed winner: exact recoverable save-failure outcome'
+    );
+    const afterBlocked = handoffTableState(dbPath);
+    assertHandoffStateUnchanged(afterBlocked, before, 'unique backstop without winner row');
+    assert.equal(
+      afterBlocked.renewal_events.length,
+      before.renewal_events.length,
+      'the pre-existing event is the only event; nothing partial was added'
+    );
+
+    // Now commit the winner transition (as the double-writer's successful
+    // partner would have). A repeat handoff is rejected again by the
+    // index; the UNIQUE-recovery re-read applies the same under-lock
+    // eligibility check to the committed winner and returns it
+    // idempotently: full outcome is the saved winner — original handoff
+    // time, no second event, no second version increment.
+    const commitWinner = initDatabase(dbPath);
+    try {
+      commitWinner.exec('BEGIN IMMEDIATE');
+      commitWinner
+        .prepare(
+          `UPDATE renewals
+              SET status = ?, next_actor = 'prescriber', handoff_at = ?, version = version + 1
+            WHERE id = ?`
+        )
+        .run(STATUS_LABELS.AWAITING_PRESCRIBER, winnerAt, HANDOFF_TARGET.rn);
+      commitWinner.exec('COMMIT');
+    } finally {
+      commitWinner.close();
+    }
+
+    const expectedWinner = {
+      id: HANDOFF_TARGET.rn,
+      prescription_id: HANDOFF_TARGET.rx,
+      patient_id: HANDOFF_TARGET.patient,
+      pharmacy_id: HANDOFF_TARGET.pharmacy,
+      prescriber_id: HANDOFF_TARGET.prescriber,
+      status: STATUS_LABELS.AWAITING_PRESCRIBER,
+      next_actor: 'prescriber',
+      submitted_at: '2026-11-21T12:00:00Z',
+      handoff_at: winnerAt,
+      decided_at: null,
+      granted_refills: null,
+      request_idempotency_key: null,
+      version: 2,
+    };
+    const replay = handoffRenewalToPrescriber(dbPath, HANDOFF_PHARMACY, HANDOFF_TARGET.rn);
+    assert.deepEqual(
+      replay,
+      {
+        ok: true,
+        code: 'already-handed-off',
+        handed_off: true,
+        renewal: expectedWinner,
+        lockRetries: 0,
+      },
+      'eligible committed winner returned idempotently with the original handoff time'
+    );
+    const check = initDatabase(dbPath);
+    try {
+      assert.equal(
+        check
+          .prepare(`SELECT COUNT(*) AS n FROM renewal_events WHERE renewal_id = ? AND event_type = ?`)
+          .get(HANDOFF_TARGET.rn, EVENT_TYPES.HANDOFF).n,
+        1,
+        'still exactly one handoff event after the backstop exercises'
+      );
+    } finally {
+      check.close();
+    }
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

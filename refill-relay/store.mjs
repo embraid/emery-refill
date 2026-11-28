@@ -867,6 +867,17 @@ function renewalView(row) {
 
 const isFinalStatus = (status) => !NON_FINAL_STATUSES.includes(status);
 
+// Handoff eligibility for a FRESHLY LOCKED renewal row: the acting pharmacy
+// still owns the case and a prescriber is assigned. Applied under the write
+// lock both before a transition is made and before a replay (already
+// 'Awaiting prescriber') is returned, and again to any committed winner
+// found during the UNIQUE-recovery re-read, so no path ever returns a replay
+// or a transition for an ineligible row.
+const handoffEligible = (row, pharmacyId) =>
+  Boolean(
+    row && row.pharmacy_id === String(pharmacyId) && row.prescriber_id
+  );
+
 export function askPatientForRenewal(dbPath, identity, prescriptionId, options = {}) {
   const id = identity && identity.id;
   const rxId =
@@ -1036,6 +1047,215 @@ export function askPatientForRenewal(dbPath, identity, prescriptionId, options =
         throw err;
       }
       return { ok: false, code: 'ask-save-failed', recoverable: true, lockRetries };
+    }
+  } finally {
+    // The transaction (if still open) is discarded with the connection.
+    db.close();
+  }
+}
+
+
+/**
+ * Pharmacy handoff: the assigned responsible pharmacy advances its own
+ * 'Sent to pharmacy' renewal to 'Awaiting prescriber' — the SAME renewal
+ * row — setting the prescriber role as next actor, recording the handoff
+ * time, bumping the version, and inserting exactly one canonical
+ * 'handoff' event, all atomically in one write transaction.
+ *
+ *   dbPath — the durable SQLite file.
+ *   identity = { id, role } — the current durable session identity (the
+ *                role comes from the server-side session, never from the
+ *                client).
+ *   renewalId — the server-resolved renewal record (the stable case ref is
+ *                resolved by the caller before this point).
+ *   options.failHandoffCommit — TEST-ONLY injected persistence failure
+ *                AFTER the real UPDATE + event INSERT and BEFORE the
+ *                COMMIT (mirrors the ask's failAskCommit seam). Off by
+ *                default; the rollback is what removes the attempted
+ *                writes.
+ *
+ * Outcomes:
+ *   first handoff:  { ok: true, code: 'handed-off', handed_off: true,
+ *                     renewal: renewalView, lockRetries }
+ *   replay / repeat: { ok: true, code: 'already-handed-off',
+ *                     handed_off: true, renewal: renewalView,
+ *                     lockRetries } — the original handoff_at is
+ *                     preserved; no second event is inserted.
+ *   denial:         { ok: false, code: 'not-authorized', ... }
+ *   save failure:   { ok: false, code: 'handoff-save-failed',
+ *                     recoverable: true, lockRetries }
+ *
+ * The denial is deliberately OPAQUE: a renewal id that does not exist and
+ * a renewal assigned to another pharmacy produce the exact same fixed
+ * denial (the same no-existence-disclosure discipline as getRoleCase), and
+ * no denial carries any case field. The same fixed denial { ok: false,
+ * code: 'not-authorized' } is returned for ineligible or out-of-window
+ * rows — the acting pharmacy no longer owns the case, no prescriber is
+ * assigned, or the status is not 'Sent to pharmacy' / 'Awaiting prescriber'
+ * (e.g. a final status): the record is not handable, and no event or state
+ * change occurs. The under-lock eligibility check is applied before either
+ * returning a replay or making the transition, and again to any committed
+ * winner returned during the UNIQUE-recovery re-read.
+ *
+ * Integrity mirrors the ask transaction: one BEGIN IMMEDIATE write
+ * transaction with the same bounded lock retry, an under-lock re-read,
+ * and the renewal_events_one_handoff unique index as the defense-in-depth
+ * backstop for a pathological double-writer (a rejected second event is
+ * converted to the idempotent already-handed-off outcome when a committed
+ * winner exists).
+ */
+export function handoffRenewalToPrescriber(dbPath, identity, renewalId, options = {}) {
+  const id = identity && identity.id;
+  const rnId =
+    renewalId === undefined || renewalId === null ? '' : String(renewalId);
+  const db = open(dbPath);
+  let locked = false;
+  let lockRetries = 0;
+  try {
+    // (1) Authorize (pure read on this short-lived connection): pharmacy
+    // role, and object-level assignment to the requesting pharmacy.
+    if (!identity || identity.role !== 'pharmacy' || !id) {
+      return { ok: false, code: 'not-authorized' };
+    }
+    const row = db.prepare(`SELECT * FROM renewals WHERE id = ?`).get(rnId);
+    if (!row || row.pharmacy_id !== String(id)) {
+      // One opaque result for an unknown id and an unrelated id: no
+      // existence or assignment disclosure.
+      return { ok: false, code: 'not-authorized' };
+    }
+
+    // (2) Acquire the write lock with the bounded retry. Observed
+    // node:sqlite behavior: a concurrent writer makes BEGIN IMMEDIATE
+    // throw "database is locked" immediately; the retry acquires it once
+    // the holder releases (same loop as the ask path).
+    const begin = db.prepare('BEGIN IMMEDIATE');
+    for (let attempt = 1; attempt <= ASK_LOCK_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        begin.run();
+        locked = true;
+        break;
+      } catch (err) {
+        const message = String((err && err.message) || '');
+        if (!/database is locked/i.test(message) && !/SQLITE_BUSY/i.test(message)) {
+          throw err;
+        }
+        lockRetries += 1;
+        if (attempt < ASK_LOCK_MAX_ATTEMPTS) askLockSleepSync(ASK_LOCK_RETRY_DELAY_MS);
+      }
+    }
+    if (!locked) {
+      // Budget exhausted under sustained contention: no durable state was
+      // changed; the client may retry.
+      return { ok: false, code: 'handoff-save-failed', recoverable: true, lockRetries };
+    }
+
+    // (3) Re-read the row under the write lock (fresh, AFTER acquisition),
+    // and verify the under-lock eligibility before either returning a
+    // replay or making the transition: the acting pharmacy must still own
+    // the case and a prescriber must be assigned.
+    const current = db.prepare(`SELECT * FROM renewals WHERE id = ?`).get(rnId);
+    if (!handoffEligible(current, id)) {
+      // Ineligible row (ownership changed, prescriber unassigned, or the
+      // record is gone): the plan's exact fixed denial, no status detail,
+      // no event, no state change.
+      db.exec('ROLLBACK');
+      locked = false;
+      return { ok: false, code: 'not-authorized' };
+    }
+    if (current.status === STATUS_LABELS.AWAITING_PRESCRIBER) {
+      // Replay / overlapping loser: the handoff is already committed.
+      // Roll back the no-op transaction and return the saved state
+      // idempotently — the original handoff_at is preserved, and no
+      // second event is inserted.
+      db.exec('ROLLBACK');
+      locked = false;
+      return {
+        ok: true,
+        code: 'already-handed-off',
+        handed_off: true,
+        renewal: renewalView(current),
+        lockRetries,
+      };
+    }
+    if (current.status !== STATUS_LABELS.SENT_TO_PHARMACY) {
+      // Eligible assignment but outside the handoff window (e.g. a final
+      // status): the same fixed denial, no status detail, no event, no
+      // state change.
+      db.exec('ROLLBACK');
+      locked = false;
+      return { ok: false, code: 'not-authorized' };
+    }
+
+    // (4) The atomic writes inside the transaction: one renewal-row
+    // update (guarded by the under-lock re-read) + one handoff event at
+    // the same handoff time.
+    const now = new Date().toISOString();
+    try {
+      db.prepare(
+        `UPDATE renewals
+            SET status = ?, next_actor = 'prescriber', handoff_at = ?,
+                version = version + 1
+          WHERE id = ?`
+      ).run(STATUS_LABELS.AWAITING_PRESCRIBER, now, rnId);
+      db.prepare(
+        `INSERT INTO renewal_events
+           (renewal_id, event_type, actor_role, actor_id, occurred_at, payload)
+         VALUES (?, ?, 'pharmacy', ?, ?, ?)`
+      ).run(
+        rnId,
+        EVENT_TYPES.HANDOFF,
+        String(id),
+        now,
+        JSON.stringify({ synthetic: true, renewal_id: rnId })
+      );
+      // Injected persistence failure point: AFTER the UPDATE + INSERT and
+      // BEFORE the COMMIT (mirrors the ask's failAskCommit seam). The
+      // attempted writes are still inside the open transaction, so the
+      // ROLLBACK below is what removes them.
+      if (options && options.failHandoffCommit) {
+        throw new Error('simulated SQLite failure while committing the handoff');
+      }
+      db.exec('COMMIT');
+      locked = false;
+      const updated = db.prepare(`SELECT * FROM renewals WHERE id = ?`).get(rnId);
+      return {
+        ok: true,
+        code: 'handed-off',
+        handed_off: true,
+        renewal: renewalView(updated),
+        lockRetries,
+      };
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // The transaction already ended; the original error is authoritative.
+      }
+      locked = false;
+      // UNIQUE backstop (defense-in-depth): a pathological double-writer's
+      // second handoff event is rejected by the
+      // renewal_events_one_handoff index. ROLLBACK, re-read the
+      // now-committed row, and — only if it is eligible (acting pharmacy
+      // still owns it, prescriber assigned) and already 'Awaiting
+      // prescriber' — return it idempotently (mirrors the ask UNIQUE
+      // catch). A UNIQUE violation with no eligible committed winner is
+      // not a resolvable race: recoverable save failure.
+      if (/UNIQUE constraint failed/i.test(String((err && err.message) || ''))) {
+        const winner = db.prepare(`SELECT * FROM renewals WHERE id = ?`).get(rnId);
+        if (
+          handoffEligible(winner, id) &&
+          winner.status === STATUS_LABELS.AWAITING_PRESCRIBER
+        ) {
+          return {
+            ok: true,
+            code: 'already-handed-off',
+            handed_off: true,
+            renewal: renewalView(winner),
+            lockRetries,
+          };
+        }
+      }
+      return { ok: false, code: 'handoff-save-failed', recoverable: true, lockRetries };
     }
   } finally {
     // The transaction (if still open) is discarded with the connection.
